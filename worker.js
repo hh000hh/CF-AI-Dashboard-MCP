@@ -926,6 +926,7 @@ async function getStats(env) {
     anthropic,
 
     gemini: {
+
       enabled:
         gemini.enabled,
 
@@ -935,14 +936,18 @@ async function getStats(env) {
       budget:
         gemini.budget,
 
-      spend_this_month:
-        gemini.spend_this_month,
+      invoice_this_month:
+        gemini.invoice_this_month,
 
-      remaining_budget:
-        gemini.remaining_budget,
+      credits_this_month:
+        gemini.credits_this_month,
 
       billing_data_ready:
-        gemini.billing_data_ready
+        gemini.billing_data_ready,
+
+      billing_breakdown:
+        gemini.billing_breakdown || []
+
     },
 
     groq,
@@ -1086,11 +1091,20 @@ ${gemini.status ?? "N/A"}
 Budget:
 ${gemini.budget ?? 0}
 
-Spend This Month:
-${gemini.spend_this_month ?? 0}
+Invoice This Month:
+${gemini.invoice_this_month ?? 0}
 
-Remaining Budget:
-${gemini.remaining_budget ?? 0}
+Credits This Month:
+${gemini.credits_this_month ?? 0}
+
+Billing Breakdown:
+${(gemini.billing_breakdown || [])
+      .map(
+        x =>
+          `${x.service}: ${x.cost}`
+      )
+      .join("\n")
+    }
 
 Billing Data Ready:
 ${gemini.billing_data_ready ? "Yes" : "No"}
@@ -1388,14 +1402,18 @@ async function getDebugStats(env) {
         budget:
           gemini?.budget,
 
-        spend_this_month:
-          gemini?.spend_this_month,
+        invoice_this_month:
+          gemini?.invoice_this_month,
 
-        remaining_budget:
-          gemini?.remaining_budget,
+        credits_this_month:
+          gemini?.credits_this_month,
 
         billing_data_ready:
-          gemini?.billing_data_ready
+          gemini?.billing_data_ready,
+
+        billing_breakdown:
+          gemini?.billing_breakdown || []
+
       },
 
       groq: {
@@ -2239,9 +2257,9 @@ async function getOpenAIDebug(env) {
       regionRestricted
         ? "region_restricted"
         : (
-            costsResp.ok &&
-            usageResp.ok
-          )
+          costsResp.ok &&
+          usageResp.ok
+        )
           ? "ok"
           : "error",
 
@@ -2619,28 +2637,39 @@ async function queryGcpBillingFromBigQuery(
     `\`${projectId}.${datasetId}.${tableName}\``;
 
   const sqlQuery = `
-    SELECT
-      COALESCE(SUM(cost), 0) AS total_cost,
+  SELECT
+    service.description,
 
-      COALESCE(
-        SUM(
-          (
-            SELECT COALESCE(
-              SUM(c.amount),
-              0
-            )
-            FROM UNNEST(credits) c
+    COALESCE(
+      SUM(CAST(cost AS FLOAT64)),
+      0
+    ) AS total_cost,
+
+    COALESCE(
+      SUM(
+        (
+          SELECT COALESCE(
+            SUM(CAST(c.amount AS FLOAT64)),
+            0
           )
-        ),
-        0
-      ) AS total_credits
+          FROM UNNEST(credits) c
+        )
+      ),
+      0
+    ) AS total_credits
 
-    FROM
-      ${tablePath}
+  FROM
+    ${tablePath}
 
-    WHERE
-      invoice.month = @current_month
-  `;
+  WHERE
+    invoice.month = @current_month
+
+  GROUP BY
+    1
+
+  ORDER BY
+    total_cost DESC
+`;
 
   const url =
     `https://bigquery.googleapis.com/bigquery/v2/projects/${projectId}/queries`;
@@ -2681,6 +2710,7 @@ async function queryGcpBillingFromBigQuery(
     throw new Error(
       `BigQuery Query Failed: ${errText}`
     );
+
   }
 
   const json =
@@ -2690,28 +2720,73 @@ async function queryGcpBillingFromBigQuery(
     !json.rows ||
     !json.rows.length
   ) {
+
     return {
       totalCost: 0,
       totalCredits: 0,
+      breakdown: [],
       dataReady: false
     };
+
   }
 
-  const values =
-    json.rows[0].f;
+  let totalCost = 0;
+  let totalCredits = 0;
+
+  const breakdown = [];
+
+  for (const row of json.rows) {
+
+    const service =
+      row.f?.[0]?.v || "Unknown";
+
+    const cost =
+      Number(
+        row.f?.[1]?.v || 0
+      );
+
+    const credits =
+      Number(
+        row.f?.[2]?.v || 0
+      );
+
+    totalCost += cost;
+    totalCredits += credits;
+
+    breakdown.push({
+
+      service,
+
+      cost,
+
+      credits
+
+    });
+
+  }
 
   return {
+
     totalCost:
-      Number(values[0]?.v || 0),
+      Number(
+        totalCost.toFixed(6)
+      ),
 
     totalCredits:
-      Number(values[1]?.v || 0),
+      Number(
+        totalCredits.toFixed(6)
+      ),
+
+    breakdown,
 
     dataReady: true
+
   };
+
 }
 
 async function getGeminiStats(env) {
+
   if (!env.GOOGLE_API_KEY) {
     return {
       enabled: false,
@@ -2723,13 +2798,16 @@ async function getGeminiStats(env) {
   let tokenError = null;
 
   try {
-    managementToken = await getGoogleManagementToken(env);
+    managementToken =
+      await getGoogleManagementToken(env);
   } catch (err) {
     tokenError = err.message;
   }
 
   const INITIAL_BUDGET =
-    Number(env.GEMINI_INITIAL_BUDGET || 0);
+    Number(
+      env.GEMINI_INITIAL_BUDGET || 0
+    );
 
   const endTimeIso =
     new Date().toISOString();
@@ -2747,34 +2825,42 @@ async function getGeminiStats(env) {
       .replace("-", "");
 
   let bqCostData = {
+
     totalCost: 0,
-    totalCredits: 0
+
+    totalCredits: 0,
+
+    breakdown: [],
+
+    dataReady: false
+
   };
 
   let bqError = null;
 
-  // ==========================================
-  // BigQuery Billing Query
-  // ==========================================
   if (
     managementToken &&
     env.BQ_BILLING_TABLE
   ) {
+
     try {
+
       bqCostData =
         await queryGcpBillingFromBigQuery(
           env,
           managementToken,
           currentMonth
         );
+
     } catch (err) {
-      bqError = err.message;
+
+      bqError =
+        err.message;
+
     }
+
   }
 
-  // ==========================================
-  // KV Token Statistics
-  // ==========================================
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
 
@@ -2782,6 +2868,7 @@ async function getGeminiStats(env) {
   let recent30DaysOutputTokens = 0;
 
   try {
+
     if (env.CF_DASHBOARD_KV) {
 
       totalInputTokens =
@@ -2821,33 +2908,17 @@ async function getGeminiStats(env) {
               `gemini_output_${dateStr}`
             ) || 0
           );
+
       }
+
     }
+
   } catch (_) { }
 
-  // ==========================================
-  // Actual Cost
-  // ==========================================
-
-  const actualSpendThisMonth =
+  const invoiceAmountThisMonth =
     Number(
-      (
-        bqCostData.totalCost +
-        bqCostData.totalCredits
-      ).toFixed(6)
+      bqCostData.totalCost.toFixed(6)
     );
-
-  const remainingBudget =
-    Number(
-      (
-        INITIAL_BUDGET -
-        actualSpendThisMonth
-      ).toFixed(6)
-    );
-
-  // 使用 BigQuery 返回状态
-  const billingDataReady =
-    !!bqCostData.dataReady;
 
   return {
 
@@ -2861,53 +2932,25 @@ async function getGeminiStats(env) {
     error_message:
       tokenError || bqError,
 
-    // ==========================================
-    // Budget Dashboard
-    // ==========================================
+    budget:
+      INITIAL_BUDGET,
 
-    budget: INITIAL_BUDGET,
+    invoice_this_month:
+      invoiceAmountThisMonth,
 
-    spend_this_month:
-      actualSpendThisMonth,
-
-    remaining_budget:
-      remainingBudget,
+    credits_this_month:
+      bqCostData.totalCredits,
 
     billing_data_ready:
-      billingDataReady,
+      bqCostData.dataReady,
 
-    // ==========================================
-    // BigQuery Debug
-    // ==========================================
-
-    bigquery_debug: {
-
-      current_month:
-        currentMonth,
-
-      data_ready:
-        bqCostData.dataReady,
-
-      raw_cost:
-        bqCostData.totalCost,
-
-      raw_credits:
-        bqCostData.totalCredits,
-
-      actual_spend:
-        actualSpendThisMonth,
-
-      budget_set:
-        INITIAL_BUDGET
-    },
-
-    // ==========================================
-    // Token Statistics
-    // ==========================================
+    billing_breakdown:
+      bqCostData.breakdown || [],
 
     token_usage_stats: {
 
       past_30_days: {
+
         input_tokens:
           recent30DaysInputTokens,
 
@@ -2917,9 +2960,11 @@ async function getGeminiStats(env) {
         total_tokens:
           recent30DaysInputTokens +
           recent30DaysOutputTokens
+
       },
 
       all_time: {
+
         input_tokens:
           totalInputTokens,
 
@@ -2929,7 +2974,9 @@ async function getGeminiStats(env) {
         total_tokens:
           totalInputTokens +
           totalOutputTokens
+
       }
+
     },
 
     query_info: {
@@ -2948,8 +2995,11 @@ async function getGeminiStats(env) {
 
       time_range_30_days:
         `${startTimeIso.split("T")[0]} 至 ${endTimeIso.split("T")[0]}`
+
     }
+
   };
+
 }
 
 async function getGeminiDebug(env) {
@@ -2983,6 +3033,7 @@ async function getGeminiDebug(env) {
       status: "failed",
       error: e.message
     };
+
   }
 
   const currentMonth =
@@ -3021,13 +3072,24 @@ async function getGeminiDebug(env) {
       bqData = {
         error: e.message
       };
+
     }
 
-  } else if (!env.BQ_BILLING_TABLE) {
+  } else if (
+    !env.BQ_BILLING_TABLE
+  ) {
 
     bqStatus =
       "billing_table_not_configured";
+
   }
+
+  const invoiceAmount =
+    Number(
+      (
+        bqData?.totalCost || 0
+      ).toFixed(6)
+    );
 
   return {
 
@@ -3065,6 +3127,7 @@ async function getGeminiDebug(env) {
 
       billing_table_configured:
         !!env.BQ_BILLING_TABLE
+
     },
 
     debug_raw_responses: {
@@ -3072,13 +3135,22 @@ async function getGeminiDebug(env) {
       current_month:
         currentMonth,
 
-      bigquery_result:
-        bqData,
-
       billing_data_ready:
-        bqData?.dataReady ?? false
+        bqData?.dataReady ?? false,
+
+      invoice_amount:
+        invoiceAmount,
+
+      credits_amount:
+        bqData?.totalCredits || 0,
+
+      billing_breakdown:
+        bqData?.breakdown || []
+
     }
+
   };
+
 }
 
 async function getGroqStats(
@@ -3194,7 +3266,7 @@ async function handleMCP(request, env) {
   if (
     body.jsonrpc === "2.0" &&
     body.method ===
-      "notifications/initialized"
+    "notifications/initialized"
   ) {
 
     return new Response(
